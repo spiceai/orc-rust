@@ -167,7 +167,7 @@ pub enum OrcError {
     BuildLzoDecoder {
         #[snafu(implicit)]
         location: Location,
-        source: lzokay_native::Error,
+        source: lzo::Error,
     },
 
     #[snafu(display(

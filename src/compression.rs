@@ -221,7 +221,9 @@ struct Zstd;
 #[derive(Debug, Clone, Copy)]
 struct Snappy;
 #[derive(Debug, Clone, Copy)]
-struct Lzo;
+struct Lzo {
+    max_decompressed_block_size: usize,
+}
 #[derive(Debug, Clone, Copy)]
 struct Lz4 {
     max_decompressed_block_size: usize,
@@ -275,13 +277,26 @@ impl DecompressorVariant for Lzo {
         &self,
         compressed_bytes: &[u8],
         scratch: &mut Vec<u8>,
-        _decoded_size_limit: Option<DecodedSizeLimit>,
+        decoded_size_limit: Option<DecodedSizeLimit>,
     ) -> Result<()> {
-        let decompressed = lzokay_native::decompress_all(compressed_bytes, None)
-            .context(error::BuildLzoDecoderSnafu)?;
-        scratch.clear();
-        scratch.extend(decompressed);
-        Ok(())
+        let output_size = decoded_size_limit.map_or(self.max_decompressed_block_size, |limit| {
+            self.max_decompressed_block_size
+                .min(limit.remaining.saturating_add(1))
+        });
+        scratch.resize(output_size, 0);
+        match lzo::decompress_into(compressed_bytes, scratch) {
+            Ok(written) => {
+                scratch.truncate(written);
+                check_decoded_size(written, decoded_size_limit)
+            }
+            Err(lzo::Error::OutputOverrun)
+                if decoded_size_limit
+                    .is_some_and(|limit| limit.remaining < self.max_decompressed_block_size) =>
+            {
+                decoded_size_limit_error(decoded_size_limit.expect("limit is present"))
+            }
+            Err(source) => Err(source).context(error::BuildLzoDecoderSnafu),
+        }
     }
 }
 
@@ -323,7 +338,9 @@ fn get_decompressor_variant(
     match compression_type {
         CompressionType::Zlib => Box::new(Zlib),
         CompressionType::Snappy => Box::new(Snappy),
-        CompressionType::Lzo => Box::new(Lzo),
+        CompressionType::Lzo => Box::new(Lzo {
+            max_decompressed_block_size,
+        }),
         CompressionType::Lz4 => Box::new(Lz4 {
             max_decompressed_block_size,
         }),
@@ -777,5 +794,33 @@ mod tests {
                 "unexpected {compression_type} error: {error}"
             );
         }
+
+        let lzo_block = [
+            34, 104, 101, 108, 108, 111, 44, 32, 108, 122, 111, 32, 119, 111, 114, 108, 100, 33,
+            17, 0, 0,
+        ];
+        let mut encoded = Vec::from(CompressionHeader::Compressed(lzo_block.len() as u32).encode());
+        encoded.extend_from_slice(&lzo_block);
+        let compression = Compression::from_proto(CompressionKind::Lzo, Some(64));
+        let error = Decompressor::new_with_decoded_size_limit(
+            Bytes::from(encoded),
+            compression,
+            Vec::new(),
+            Some(4),
+        )
+        .read_to_end(&mut Vec::new())
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("decompression limit"),
+            "unexpected LZO error: {error}"
+        );
+
+        let mut decoded = Vec::new();
+        let mut encoded = Vec::from(CompressionHeader::Compressed(lzo_block.len() as u32).encode());
+        encoded.extend_from_slice(&lzo_block);
+        Decompressor::new(Bytes::from(encoded), compression, Vec::new())
+            .read_to_end(&mut decoded)
+            .unwrap();
+        assert_eq!(decoded, b"hello, lzo world!");
     }
 }
