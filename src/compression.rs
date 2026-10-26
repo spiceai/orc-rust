@@ -20,7 +20,7 @@
 
 use std::{
     borrow::Cow,
-    io::{Read, Write},
+    io::{self, Read, Write},
 };
 
 use bytes::{Bytes, BytesMut};
@@ -35,6 +35,13 @@ const DEFAULT_COMPRESSION_BLOCK_SIZE: u64 = 256 * 1024;
 
 /// Bits 1..23 of the 3-byte header store the payload length.
 const MAX_COMPRESSION_BLOCK_SIZE: u64 = 1 << 23;
+
+const MIN_METADATA_DECODE_SIZE: usize = 64 * 1024 * 1024;
+const MAX_METADATA_DECODE_RATIO: usize = 100;
+
+fn metadata_decoded_size_limit(encoded_size: usize) -> usize {
+    MIN_METADATA_DECODE_SIZE.max(encoded_size.saturating_mul(MAX_METADATA_DECODE_RATIO))
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Compression {
@@ -153,7 +160,58 @@ impl CompressionHeader {
 }
 
 trait DecompressorVariant: Send {
-    fn decompress_block(&self, compressed_bytes: &[u8], scratch: &mut Vec<u8>) -> Result<()>;
+    fn decompress_block(
+        &self,
+        compressed_bytes: &[u8],
+        scratch: &mut Vec<u8>,
+        decoded_size_limit: Option<DecodedSizeLimit>,
+    ) -> Result<()>;
+}
+
+#[derive(Clone, Copy)]
+struct DecodedSizeLimit {
+    total: usize,
+    remaining: usize,
+}
+
+fn decoded_size_limit_error<T>(limit: DecodedSizeLimit) -> Result<T> {
+    error::MetadataDecompressionLimitSnafu {
+        decoded_size_limit: limit.total,
+    }
+    .fail()
+}
+
+fn check_decoded_size(decoded_size: usize, limit: Option<DecodedSizeLimit>) -> Result<()> {
+    if let Some(limit) = limit {
+        if decoded_size > limit.remaining {
+            return decoded_size_limit_error(limit);
+        }
+    }
+    Ok(())
+}
+
+fn read_to_end(
+    mut reader: impl Read,
+    scratch: &mut Vec<u8>,
+    limit: Option<DecodedSizeLimit>,
+) -> Result<()> {
+    scratch.clear();
+    match limit {
+        Some(limit) => {
+            let max_read = u64::try_from(limit.remaining)
+                .unwrap_or(u64::MAX)
+                .saturating_add(1);
+            reader
+                .take(max_read)
+                .read_to_end(scratch)
+                .context(error::IoSnafu)?;
+            check_decoded_size(scratch.len(), Some(limit))
+        }
+        None => {
+            reader.read_to_end(scratch).context(error::IoSnafu)?;
+            Ok(())
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -170,28 +228,39 @@ struct Lz4 {
 }
 
 impl DecompressorVariant for Zlib {
-    fn decompress_block(&self, compressed_bytes: &[u8], scratch: &mut Vec<u8>) -> Result<()> {
-        let mut gz = flate2::read::DeflateDecoder::new(compressed_bytes);
-        scratch.clear();
-        gz.read_to_end(scratch).context(error::IoSnafu)?;
-        Ok(())
+    fn decompress_block(
+        &self,
+        compressed_bytes: &[u8],
+        scratch: &mut Vec<u8>,
+        decoded_size_limit: Option<DecodedSizeLimit>,
+    ) -> Result<()> {
+        let gz = flate2::read::DeflateDecoder::new(compressed_bytes);
+        read_to_end(gz, scratch, decoded_size_limit)
     }
 }
 
 impl DecompressorVariant for Zstd {
-    fn decompress_block(&self, compressed_bytes: &[u8], scratch: &mut Vec<u8>) -> Result<()> {
-        let mut reader =
-            zstd::Decoder::new(compressed_bytes).context(error::BuildZstdDecoderSnafu)?;
-        scratch.clear();
-        reader.read_to_end(scratch).context(error::IoSnafu)?;
-        Ok(())
+    fn decompress_block(
+        &self,
+        compressed_bytes: &[u8],
+        scratch: &mut Vec<u8>,
+        decoded_size_limit: Option<DecodedSizeLimit>,
+    ) -> Result<()> {
+        let reader = zstd::Decoder::new(compressed_bytes).context(error::BuildZstdDecoderSnafu)?;
+        read_to_end(reader, scratch, decoded_size_limit)
     }
 }
 
 impl DecompressorVariant for Snappy {
-    fn decompress_block(&self, compressed_bytes: &[u8], scratch: &mut Vec<u8>) -> Result<()> {
+    fn decompress_block(
+        &self,
+        compressed_bytes: &[u8],
+        scratch: &mut Vec<u8>,
+        decoded_size_limit: Option<DecodedSizeLimit>,
+    ) -> Result<()> {
         let len =
             snap::raw::decompress_len(compressed_bytes).context(error::BuildSnappyDecoderSnafu)?;
+        check_decoded_size(len, decoded_size_limit)?;
         scratch.resize(len, 0);
         let mut decoder = snap::raw::Decoder::new();
         decoder
@@ -202,10 +271,14 @@ impl DecompressorVariant for Snappy {
 }
 
 impl DecompressorVariant for Lzo {
-    fn decompress_block(&self, compressed_bytes: &[u8], scratch: &mut Vec<u8>) -> Result<()> {
+    fn decompress_block(
+        &self,
+        compressed_bytes: &[u8],
+        scratch: &mut Vec<u8>,
+        _decoded_size_limit: Option<DecodedSizeLimit>,
+    ) -> Result<()> {
         let decompressed = lzokay_native::decompress_all(compressed_bytes, None)
             .context(error::BuildLzoDecoderSnafu)?;
-        // TODO: better way to utilize scratch here
         scratch.clear();
         scratch.extend(decompressed);
         Ok(())
@@ -213,14 +286,30 @@ impl DecompressorVariant for Lzo {
 }
 
 impl DecompressorVariant for Lz4 {
-    fn decompress_block(&self, compressed_bytes: &[u8], scratch: &mut Vec<u8>) -> Result<()> {
-        let decompressed =
-            lz4_flex::block::decompress(compressed_bytes, self.max_decompressed_block_size)
-                .context(error::BuildLz4DecoderSnafu)?;
-        // TODO: better way to utilize scratch here
-        scratch.clear();
-        scratch.extend(decompressed);
-        Ok(())
+    fn decompress_block(
+        &self,
+        compressed_bytes: &[u8],
+        scratch: &mut Vec<u8>,
+        decoded_size_limit: Option<DecodedSizeLimit>,
+    ) -> Result<()> {
+        let output_size = decoded_size_limit.map_or(self.max_decompressed_block_size, |limit| {
+            self.max_decompressed_block_size
+                .min(limit.remaining.saturating_add(1))
+        });
+        scratch.resize(output_size, 0);
+        match lz4_flex::block::decompress_into(compressed_bytes, scratch) {
+            Ok(written) => {
+                scratch.truncate(written);
+                check_decoded_size(written, decoded_size_limit)
+            }
+            Err(lz4_flex::block::DecompressError::OutputTooSmall { .. })
+                if decoded_size_limit
+                    .is_some_and(|limit| limit.remaining < self.max_decompressed_block_size) =>
+            {
+                decoded_size_limit_error(decoded_size_limit.expect("limit is present"))
+            }
+            Err(source) => Err(source).context(error::BuildLz4DecoderSnafu),
+        }
     }
 }
 
@@ -252,16 +341,38 @@ struct DecompressorIter {
     current: Option<State>, // when we have compression but the value is original
     compression: Option<Box<dyn DecompressorVariant>>,
     scratch: Vec<u8>,
+    decoded_size: usize,
+    decoded_size_limit: Option<usize>,
 }
 
 impl DecompressorIter {
-    fn new(stream: Bytes, compression: Option<Compression>, scratch: Vec<u8>) -> Self {
+    fn new(
+        stream: Bytes,
+        compression: Option<Compression>,
+        scratch: Vec<u8>,
+        decoded_size_limit: Option<usize>,
+    ) -> Self {
         Self {
             stream: BytesMut::from(stream.as_ref()),
             current: None,
             compression: compression.map(get_decompressor_variant),
             scratch,
+            decoded_size: 0,
+            decoded_size_limit,
         }
+    }
+
+    fn next_decoded_size_limit(&self) -> Option<DecodedSizeLimit> {
+        self.decoded_size_limit.map(|total| DecodedSizeLimit {
+            total,
+            remaining: total.saturating_sub(self.decoded_size),
+        })
+    }
+
+    fn record_decoded_size(&mut self, decoded_size: usize) -> Result<()> {
+        check_decoded_size(decoded_size, self.next_decoded_size_limit())?;
+        self.decoded_size = self.decoded_size.saturating_add(decoded_size);
+        Ok(())
     }
 }
 
@@ -284,12 +395,19 @@ impl FallibleStreamingIterator for DecompressorIter {
                 let header = [header[0], header[1], header[2]];
                 match CompressionHeader::decode(header) {
                     CompressionHeader::Original(length) => {
+                        self.record_decoded_size(length as usize)?;
                         let original = self.stream.split_to(length as usize);
                         self.current = Some(State::Original(original.into()));
                     }
                     CompressionHeader::Compressed(length) => {
                         let compressed = self.stream.split_to(length as usize);
-                        compression.decompress_block(&compressed, &mut self.scratch)?;
+                        let decoded_size_limit = self.next_decoded_size_limit();
+                        compression.decompress_block(
+                            &compressed,
+                            &mut self.scratch,
+                            decoded_size_limit,
+                        )?;
+                        self.record_decoded_size(self.scratch.len())?;
                         self.current = Some(State::Compressed(std::mem::take(&mut self.scratch)));
                     }
                 };
@@ -297,6 +415,7 @@ impl FallibleStreamingIterator for DecompressorIter {
             }
             None => {
                 // TODO: take stratch from current State::Compressed for re-use
+                self.record_decoded_size(self.stream.len())?;
                 self.current = Some(State::Original(self.stream.clone().into()));
                 self.stream.clear();
                 Ok(())
@@ -323,8 +442,23 @@ pub struct Decompressor {
 impl Decompressor {
     /// Creates a new [`Decompressor`] that will use `scratch` as a temporary region.
     pub fn new(stream: Bytes, compression: Option<Compression>, scratch: Vec<u8>) -> Self {
+        Self::new_with_decoded_size_limit(stream, compression, scratch, None)
+    }
+
+    /// Creates a decompressor that rejects metadata decoded beyond 64 MiB and 100 times its encoded size.
+    pub fn new_metadata(stream: Bytes, compression: Option<Compression>, scratch: Vec<u8>) -> Self {
+        let decoded_size_limit = metadata_decoded_size_limit(stream.len());
+        Self::new_with_decoded_size_limit(stream, compression, scratch, Some(decoded_size_limit))
+    }
+
+    fn new_with_decoded_size_limit(
+        stream: Bytes,
+        compression: Option<Compression>,
+        scratch: Vec<u8>,
+        decoded_size_limit: Option<usize>,
+    ) -> Self {
         Self {
-            decompressor: DecompressorIter::new(stream, compression, scratch),
+            decompressor: DecompressorIter::new(stream, compression, scratch, decoded_size_limit),
             offset: 0,
             is_first: true,
         }
@@ -333,7 +467,7 @@ impl Decompressor {
     // TODO: remove need for this upstream
     pub fn empty() -> Self {
         Self {
-            decompressor: DecompressorIter::new(Bytes::new(), None, vec![]),
+            decompressor: DecompressorIter::new(Bytes::new(), None, vec![], None),
             offset: 0,
             is_first: true,
         }
@@ -344,12 +478,16 @@ impl std::io::Read for Decompressor {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if self.is_first {
             self.is_first = false;
-            self.decompressor.advance().unwrap();
+            self.decompressor
+                .advance()
+                .map_err(|source| io::Error::new(io::ErrorKind::InvalidData, source))?;
         }
         let current = self.decompressor.get();
         let current = if let Some(current) = current {
             if current.len() == self.offset {
-                self.decompressor.advance().unwrap();
+                self.decompressor
+                    .advance()
+                    .map_err(|source| io::Error::new(io::ErrorKind::InvalidData, source))?;
                 self.offset = 0;
                 let current = self.decompressor.get();
                 if let Some(current) = current {
@@ -600,6 +738,44 @@ mod tests {
                 .read_to_end(&mut decoded)
                 .unwrap();
             assert_eq!(decoded, input);
+        }
+    }
+
+    #[test]
+    fn metadata_limit_scales_with_encoded_size() {
+        assert_eq!(metadata_decoded_size_limit(0), MIN_METADATA_DECODE_SIZE);
+        assert_eq!(
+            metadata_decoded_size_limit(MIN_METADATA_DECODE_SIZE),
+            MIN_METADATA_DECODE_SIZE * MAX_METADATA_DECODE_RATIO
+        );
+        assert_eq!(metadata_decoded_size_limit(usize::MAX), usize::MAX);
+    }
+
+    #[test]
+    fn bounds_metadata_decompression_for_all_codecs() {
+        let input = vec![0; 4096];
+        for compression_type in [
+            CompressionType::Zlib,
+            CompressionType::Snappy,
+            CompressionType::Lz4,
+            CompressionType::Zstd,
+        ] {
+            let mut compressor = Compressor::new(Some(compression_type), Some(4096)).unwrap();
+            let encoded = compressor.compress(&input).unwrap().into_owned();
+            let compression = Compression::from_proto(compression_type.to_proto(), Some(4096));
+            let mut decoded = Vec::new();
+            let error = Decompressor::new_with_decoded_size_limit(
+                Bytes::from(encoded),
+                compression,
+                Vec::new(),
+                Some(64),
+            )
+            .read_to_end(&mut decoded)
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("decompression limit"),
+                "unexpected {compression_type} error: {error}"
+            );
         }
     }
 }

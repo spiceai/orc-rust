@@ -65,7 +65,7 @@ fn read_bloom_filters<R: ChunkReader>(
         .context("reading stripe footer")?;
 
     let mut decompressed = Vec::new();
-    Decompressor::new(footer_bytes, compression, vec![])
+    Decompressor::new_metadata(footer_bytes, compression, vec![])
         .read_to_end(&mut decompressed)
         .context("decompressing stripe footer")?;
 
@@ -91,7 +91,7 @@ fn read_bloom_filters<R: ChunkReader>(
                 .context("reading bloom filter stream")?;
 
             let mut decompressed = Vec::new();
-            Decompressor::new(data, compression, vec![])
+            Decompressor::new_metadata(data, compression, vec![])
                 .read_to_end(&mut decompressed)
                 .context("decompressing bloom filter")?;
 

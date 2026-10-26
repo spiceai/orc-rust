@@ -249,7 +249,7 @@ pub fn parse_stripe_row_indexes(
         let column_id = column.column_id();
 
         // Try to get ROW_INDEX stream for this column
-        let row_index_stream = stripe_stream_map.get_opt(column, Kind::RowIndex);
+        let row_index_stream = stripe_stream_map.get_metadata_opt(column, Kind::RowIndex);
 
         if let Some(mut decompressor) = row_index_stream {
             // Decompress the stream
@@ -305,8 +305,8 @@ fn parse_bloom_filters(
         let column_id = column.column_id();
 
         let bloom_stream = stripe_stream_map
-            .get_opt(column, Kind::BloomFilter)
-            .or_else(|| stripe_stream_map.get_opt(column, Kind::BloomFilterUtf8));
+            .get_metadata_opt(column, Kind::BloomFilter)
+            .or_else(|| stripe_stream_map.get_metadata_opt(column, Kind::BloomFilterUtf8));
 
         if let Some(mut decompressor) = bloom_stream {
             let mut buffer = Vec::new();

@@ -610,7 +610,7 @@ mod tests {
             let footer_start = stripe.footer_offset() as usize;
             let footer_end = footer_start + stripe.footer_length() as usize;
             let mut decoded_footer = Vec::new();
-            Decompressor::new(
+            Decompressor::new_metadata(
                 file.slice(footer_start..footer_end),
                 builder.file_metadata().compression(),
                 Vec::new(),
@@ -966,7 +966,7 @@ mod tests {
             let footer_start = stripe.footer_offset() as usize;
             let footer_end = footer_start + stripe.footer_length() as usize;
             let mut decoded_footer = Vec::new();
-            Decompressor::new(
+            Decompressor::new_metadata(
                 file.slice(footer_start..footer_end),
                 builder.file_metadata().compression(),
                 Vec::new(),

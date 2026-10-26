@@ -170,6 +170,16 @@ pub enum OrcError {
         source: lzokay_native::Error,
     },
 
+    #[snafu(display(
+        "ORC metadata stream exceeds the decompression limit of {} bytes",
+        decoded_size_limit
+    ))]
+    MetadataDecompressionLimit {
+        decoded_size_limit: usize,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     #[snafu(display("Failed to build lz4 decoder: {}", source))]
     BuildLz4Decoder {
         #[snafu(implicit)]
