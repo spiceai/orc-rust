@@ -279,23 +279,32 @@ impl DecompressorVariant for Lzo {
         scratch: &mut Vec<u8>,
         decoded_size_limit: Option<DecodedSizeLimit>,
     ) -> Result<()> {
-        let output_size = decoded_size_limit.map_or(self.max_decompressed_block_size, |limit| {
-            self.max_decompressed_block_size
-                .min(limit.remaining.saturating_add(1))
-        });
-        scratch.resize(output_size, 0);
-        match lzo::decompress_into(compressed_bytes, scratch) {
-            Ok(written) => {
-                scratch.truncate(written);
-                check_decoded_size(written, decoded_size_limit)
+        let max_output_size =
+            decoded_size_limit.map_or(self.max_decompressed_block_size, |limit| {
+                self.max_decompressed_block_size
+                    .min(limit.remaining.saturating_add(1))
+            });
+        // The block size comes from the file, so grow the output with the data instead of allocating it up front.
+        let mut output_size = max_output_size.min(DEFAULT_COMPRESSION_BLOCK_SIZE as usize);
+        loop {
+            scratch.resize(output_size, 0);
+            match lzo::decompress_into(compressed_bytes, scratch) {
+                Ok(written) => {
+                    scratch.truncate(written);
+                    return check_decoded_size(written, decoded_size_limit);
+                }
+                Err(lzo::Error::OutputOverrun) if output_size < max_output_size => {
+                    output_size = output_size.saturating_mul(2).min(max_output_size);
+                }
+                Err(lzo::Error::OutputOverrun)
+                    if decoded_size_limit.is_some_and(|limit| {
+                        limit.remaining < self.max_decompressed_block_size
+                    }) =>
+                {
+                    return decoded_size_limit_error(decoded_size_limit.expect("limit is present"));
+                }
+                Err(source) => return Err(source).context(error::BuildLzoDecoderSnafu),
             }
-            Err(lzo::Error::OutputOverrun)
-                if decoded_size_limit
-                    .is_some_and(|limit| limit.remaining < self.max_decompressed_block_size) =>
-            {
-                decoded_size_limit_error(decoded_size_limit.expect("limit is present"))
-            }
-            Err(source) => Err(source).context(error::BuildLzoDecoderSnafu),
         }
     }
 }
@@ -763,7 +772,7 @@ mod tests {
         assert_eq!(metadata_decoded_size_limit(0), MIN_METADATA_DECODE_SIZE);
         assert_eq!(
             metadata_decoded_size_limit(MIN_METADATA_DECODE_SIZE),
-            MIN_METADATA_DECODE_SIZE * MAX_METADATA_DECODE_RATIO
+            MIN_METADATA_DECODE_SIZE.saturating_mul(MAX_METADATA_DECODE_RATIO)
         );
         assert_eq!(metadata_decoded_size_limit(usize::MAX), usize::MAX);
     }
@@ -822,5 +831,24 @@ mod tests {
             .read_to_end(&mut decoded)
             .unwrap();
         assert_eq!(decoded, b"hello, lzo world!");
+    }
+
+    #[test]
+    fn lzo_output_grows_past_the_initial_buffer_for_any_advertised_block_size() {
+        // One literal byte, then a distance-1 match whose zero-extended length repeats it.
+        let mut lzo_block = vec![18, b'a', 0x20];
+        lzo_block.extend(std::iter::repeat_n(0, 1200));
+        lzo_block.extend_from_slice(&[1, 0, 0, 17, 0, 0]);
+        let expected = lzo::decompress(&lzo_block, 1 << 20).unwrap();
+        assert!(expected.len() > DEFAULT_COMPRESSION_BLOCK_SIZE as usize);
+
+        let mut encoded = Vec::from(CompressionHeader::Compressed(lzo_block.len() as u32).encode());
+        encoded.extend_from_slice(&lzo_block);
+        let compression = Compression::from_proto(CompressionKind::Lzo, Some(u64::MAX));
+        let mut decoded = Vec::new();
+        Decompressor::new(Bytes::from(encoded), compression, Vec::new())
+            .read_to_end(&mut decoded)
+            .unwrap();
+        assert_eq!(decoded, expected);
     }
 }
