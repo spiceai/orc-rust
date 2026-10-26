@@ -322,7 +322,7 @@ pub async fn read_metadata_async<R: super::AsyncChunkReader>(
 
 fn deserialize_footer(bytes: Bytes, compression: Option<Compression>) -> Result<Footer> {
     let mut buffer = vec![];
-    Decompressor::new(bytes, compression, vec![])
+    Decompressor::new_metadata(bytes, compression, vec![])
         .read_to_end(&mut buffer)
         .context(error::IoSnafu)?;
     Footer::decode(buffer.as_slice()).context(error::DecodeProtoSnafu)
@@ -330,8 +330,30 @@ fn deserialize_footer(bytes: Bytes, compression: Option<Compression>) -> Result<
 
 fn deserialize_footer_metadata(bytes: Bytes, compression: Option<Compression>) -> Result<Metadata> {
     let mut buffer = vec![];
-    Decompressor::new(bytes, compression, vec![])
+    Decompressor::new_metadata(bytes, compression, vec![])
         .read_to_end(&mut buffer)
         .context(error::IoSnafu)?;
     Metadata::decode(buffer.as_slice()).context(error::DecodeProtoSnafu)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compression::{CompressionType, Compressor};
+
+    #[test]
+    fn rejects_high_ratio_footer_metadata() {
+        let input = vec![0; 64 * 1024 * 1024 + 1];
+        let mut compressor =
+            Compressor::new(Some(CompressionType::Zstd), Some(256 * 1024)).unwrap();
+        let encoded = compressor.compress(&input).unwrap().into_owned();
+        let compression =
+            Compression::from_proto(CompressionType::Zstd.to_proto(), Some(256 * 1024));
+
+        let error = deserialize_footer(Bytes::from(encoded), compression).unwrap_err();
+        assert!(
+            error.to_string().contains("decompression limit"),
+            "unexpected error: {error}"
+        );
+    }
 }

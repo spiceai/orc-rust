@@ -333,6 +333,15 @@ impl StreamMap {
             .cloned()
             .map(|data| Decompressor::new(data, self.compression, vec![]))
     }
+
+    pub(crate) fn get_metadata_opt(&self, column: &Column, kind: Kind) -> Option<Decompressor> {
+        let column_id = column.column_id();
+
+        self.inner
+            .get(&(column_id, kind))
+            .cloned()
+            .map(|data| Decompressor::new_metadata(data, self.compression, vec![]))
+    }
 }
 
 fn deserialize_stripe_footer(
@@ -340,7 +349,7 @@ fn deserialize_stripe_footer(
     compression: Option<Compression>,
 ) -> Result<StripeFooter> {
     let mut buffer = vec![];
-    Decompressor::new(bytes, compression, vec![])
+    Decompressor::new_metadata(bytes, compression, vec![])
         .read_to_end(&mut buffer)
         .context(error::IoSnafu)?;
     StripeFooter::decode(buffer.as_slice()).context(error::DecodeProtoSnafu)

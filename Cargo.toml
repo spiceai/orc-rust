@@ -26,7 +26,7 @@ license = "Apache-2.0"
 description = "Implementation of Apache ORC file format using Apache Arrow in-memory format"
 keywords = ["arrow", "orc", "arrow-rs"]
 include = ["src/**/*.rs", "Cargo.toml"]
-rust-version = "1.73"
+rust-version = "1.85"
 
 [package.metadata.docs.rs]
 all-features = true
@@ -41,7 +41,7 @@ fallible-streaming-iterator = "0.1"
 flate2 = "1"
 log = "0.4"
 lz4_flex = "0.11"
-lzokay-native = "0.1"
+lzo = "0.1.4"
 num = "0.4.1"
 prost = "0.13"
 snafu = "0.8"
