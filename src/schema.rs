@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use snafu::{ensure, OptionExt};
 
-use crate::error::{NoTypesSnafu, Result, UnexpectedSnafu};
+use crate::error::{NoTypesSnafu, OutOfSpecSnafu, Result, UnexpectedSnafu};
 use crate::projection::ProjectionMask;
 use crate::proto;
 
@@ -153,7 +153,9 @@ impl RootDataType {
     /// Construct from protobuf types.
     pub(crate) fn from_proto(types: &[proto::Type]) -> Result<Self> {
         ensure!(!types.is_empty(), NoTypesSnafu {});
-        let children = parse_struct_children_from_proto(types, 0)?;
+        let mut budget = TypeTreeBudget::new(types.len());
+        budget.enter(0)?;
+        let children = parse_struct_children_from_proto(types, 0, 0, &mut budget)?;
         let all_children = get_all_children_indices_set(&children);
         Ok(Self {
             children,
@@ -168,6 +170,38 @@ impl Display for RootDataType {
         for child in &self.children {
             write!(f, "\n  {child}")?;
         }
+        Ok(())
+    }
+}
+
+/// Deepest nesting of types accepted below the root type.
+const MAX_TYPE_DEPTH: usize = 100;
+
+/// Bounds the type tree built from a footer's types list. Subtype indices can repeat or point
+/// back at an ancestor, so the tree is limited in depth and to one node per footer type, which
+/// is what a valid ORC type tree uses.
+struct TypeTreeBudget {
+    remaining: usize,
+}
+
+impl TypeTreeBudget {
+    fn new(type_count: usize) -> Self {
+        Self {
+            remaining: type_count,
+        }
+    }
+
+    /// Account for one type at `depth` levels below the root.
+    fn enter(&mut self, depth: usize) -> Result<()> {
+        ensure!(
+            depth <= MAX_TYPE_DEPTH,
+            OutOfSpecSnafu {
+                msg: format!("type tree nests more than {MAX_TYPE_DEPTH} levels")
+            }
+        );
+        self.remaining = self.remaining.checked_sub(1).context(OutOfSpecSnafu {
+            msg: "type tree references more types than the footer declares",
+        })?;
         Ok(())
     }
 }
@@ -206,6 +240,8 @@ impl Display for NamedColumn {
 fn parse_struct_children_from_proto(
     types: &[proto::Type],
     column_index: usize,
+    depth: usize,
+    budget: &mut TypeTreeBudget,
 ) -> Result<Vec<NamedColumn>> {
     // These pre-conditions should always be upheld, especially as this is a private function
     assert!(column_index < types.len());
@@ -226,7 +262,7 @@ fn parse_struct_children_from_proto(
         .map(|(&index, name)| {
             let index = index as usize;
             let name = name.to_owned();
-            let data_type = DataType::from_proto(types, index)?;
+            let data_type = DataType::from_proto(types, index, depth + 1, budget)?;
             Ok(NamedColumn { name, data_type })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -387,9 +423,15 @@ impl DataType {
         indices
     }
 
-    fn from_proto(types: &[proto::Type], column_index: usize) -> Result<Self> {
+    fn from_proto(
+        types: &[proto::Type],
+        column_index: usize,
+        depth: usize,
+        budget: &mut TypeTreeBudget,
+    ) -> Result<Self> {
         use proto::r#type::Kind;
 
+        budget.enter(depth)?;
         let ty = types.get(column_index).context(UnexpectedSnafu {
             msg: format!("Column index out of bounds: {column_index}"),
         })?;
@@ -416,7 +458,7 @@ impl DataType {
                     }
                 );
                 let child = ty.subtypes[0] as usize;
-                let child = Box::new(Self::from_proto(types, child)?);
+                let child = Box::new(Self::from_proto(types, child, depth + 1, budget)?);
                 Self::List {
                     column_index,
                     child,
@@ -434,9 +476,9 @@ impl DataType {
                     }
                 );
                 let key = ty.subtypes[0] as usize;
-                let key = Box::new(Self::from_proto(types, key)?);
+                let key = Box::new(Self::from_proto(types, key, depth + 1, budget)?);
                 let value = ty.subtypes[1] as usize;
-                let value = Box::new(Self::from_proto(types, value)?);
+                let value = Box::new(Self::from_proto(types, value, depth + 1, budget)?);
                 Self::Map {
                     column_index,
                     key,
@@ -444,7 +486,8 @@ impl DataType {
                 }
             }
             Kind::Struct => {
-                let children = parse_struct_children_from_proto(types, column_index)?;
+                let children =
+                    parse_struct_children_from_proto(types, column_index, depth, budget)?;
                 Self::Struct {
                     column_index,
                     children,
@@ -467,7 +510,7 @@ impl DataType {
                     .iter()
                     .map(|&index| {
                         let index = index as usize;
-                        Self::from_proto(types, index)
+                        Self::from_proto(types, index, depth + 1, budget)
                     })
                     .collect::<Result<Vec<_>>>()?;
                 Self::Union {
@@ -639,5 +682,94 @@ impl Display for DataType {
                 Ok(())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proto::r#type::Kind;
+
+    fn ty(kind: Kind, subtypes: &[u32], field_names: &[&str]) -> proto::Type {
+        proto::Type {
+            kind: Some(kind as i32),
+            subtypes: subtypes.to_vec(),
+            field_names: field_names.iter().map(|n| n.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// A root struct with one column: `depth - 1` nested lists around an int, so the int is
+    /// `depth` levels below the root.
+    fn nested_lists(depth: u32) -> Vec<proto::Type> {
+        let mut types = vec![ty(Kind::Struct, &[1], &["c"])];
+        for index in 1..depth {
+            types.push(ty(Kind::List, &[index + 1], &[]));
+        }
+        types.push(ty(Kind::Int, &[], &[]));
+        types
+    }
+
+    #[test]
+    fn budget_accepts_the_depth_limit_and_refuses_one_past_it() {
+        let mut budget = TypeTreeBudget::new(2);
+        budget.enter(MAX_TYPE_DEPTH).unwrap();
+        let err = budget.enter(MAX_TYPE_DEPTH + 1).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("type tree nests more than 100 levels"));
+    }
+
+    #[test]
+    fn budget_accepts_one_node_per_type_and_refuses_one_more() {
+        let mut budget = TypeTreeBudget::new(2);
+        budget.enter(0).unwrap();
+        budget.enter(1).unwrap();
+        let err = budget.enter(1).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("type tree references more types than the footer declares"));
+    }
+
+    #[test]
+    fn nested_types_load() {
+        // struct<a: int, b: list<map<string, struct<x: double>>>, u: uniontype<int, string>>
+        let types = vec![
+            ty(Kind::Struct, &[1, 2, 7], &["a", "b", "u"]),
+            ty(Kind::Int, &[], &[]),
+            ty(Kind::List, &[3], &[]),
+            ty(Kind::Map, &[4, 5], &[]),
+            ty(Kind::String, &[], &[]),
+            ty(Kind::Struct, &[6], &["x"]),
+            ty(Kind::Double, &[], &[]),
+            ty(Kind::Union, &[8, 9], &[]),
+            ty(Kind::Int, &[], &[]),
+            ty(Kind::String, &[], &[]),
+        ];
+        let root = RootDataType::from_proto(&types).unwrap();
+        let mut indices = root.all_children.iter().copied().collect::<Vec<_>>();
+        indices.sort_unstable();
+        assert_eq!(indices, (0..types.len()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_type_tree_at_the_depth_limit_loads_and_one_deeper_is_refused() {
+        RootDataType::from_proto(&nested_lists(MAX_TYPE_DEPTH as u32)).unwrap();
+        let err = RootDataType::from_proto(&nested_lists(MAX_TYPE_DEPTH as u32 + 1)).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("type tree nests more than 100 levels"));
+    }
+
+    #[test]
+    fn a_type_referenced_twice_is_refused() {
+        let types = vec![
+            ty(Kind::Struct, &[1, 1], &["a", "b"]),
+            ty(Kind::Int, &[], &[]),
+        ];
+        let err = RootDataType::from_proto(&types).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("type tree references more types than the footer declares"));
     }
 }
