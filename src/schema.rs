@@ -153,9 +153,9 @@ impl RootDataType {
     /// Construct from protobuf types.
     pub(crate) fn from_proto(types: &[proto::Type]) -> Result<Self> {
         ensure!(!types.is_empty(), NoTypesSnafu {});
-        let mut budget = TypeTreeBudget::new(types.len());
-        budget.enter(0)?;
-        let children = parse_struct_children_from_proto(types, 0, 0, &mut budget)?;
+        let mut guard = TypeTreeGuard::new(types.len());
+        guard.enter(0, 0)?;
+        let children = parse_struct_children_from_proto(types, 0, 0, &mut guard)?;
         let all_children = get_all_children_indices_set(&children);
         Ok(Self {
             children,
@@ -178,30 +178,40 @@ impl Display for RootDataType {
 const MAX_TYPE_DEPTH: usize = 100;
 
 /// Bounds the type tree built from a footer's types list. Subtype indices can repeat or point
-/// back at an ancestor, so the tree is limited in depth and to one node per footer type, which
-/// is what a valid ORC type tree uses.
-struct TypeTreeBudget {
-    remaining: usize,
+/// back at an ancestor, so the tree is limited in depth and each footer type may appear in it
+/// once, as in a valid ORC type tree.
+struct TypeTreeGuard {
+    visited: Vec<bool>,
 }
 
-impl TypeTreeBudget {
+impl TypeTreeGuard {
     fn new(type_count: usize) -> Self {
         Self {
-            remaining: type_count,
+            visited: vec![false; type_count],
         }
     }
 
-    /// Account for one type at `depth` levels below the root.
-    fn enter(&mut self, depth: usize) -> Result<()> {
+    /// Record footer type `column_index` at `depth` levels below the root.
+    fn enter(&mut self, column_index: usize, depth: usize) -> Result<()> {
         ensure!(
             depth <= MAX_TYPE_DEPTH,
             OutOfSpecSnafu {
                 msg: format!("type tree nests more than {MAX_TYPE_DEPTH} levels")
             }
         );
-        self.remaining = self.remaining.checked_sub(1).context(OutOfSpecSnafu {
-            msg: "type tree references more types than the footer declares",
-        })?;
+        let visited = self
+            .visited
+            .get_mut(column_index)
+            .context(UnexpectedSnafu {
+                msg: format!("Column index out of bounds: {column_index}"),
+            })?;
+        ensure!(
+            !*visited,
+            OutOfSpecSnafu {
+                msg: format!("type {column_index} appears more than once in the type tree")
+            }
+        );
+        *visited = true;
         Ok(())
     }
 }
@@ -241,7 +251,7 @@ fn parse_struct_children_from_proto(
     types: &[proto::Type],
     column_index: usize,
     depth: usize,
-    budget: &mut TypeTreeBudget,
+    guard: &mut TypeTreeGuard,
 ) -> Result<Vec<NamedColumn>> {
     // These pre-conditions should always be upheld, especially as this is a private function
     assert!(column_index < types.len());
@@ -262,7 +272,7 @@ fn parse_struct_children_from_proto(
         .map(|(&index, name)| {
             let index = index as usize;
             let name = name.to_owned();
-            let data_type = DataType::from_proto(types, index, depth + 1, budget)?;
+            let data_type = DataType::from_proto(types, index, depth + 1, guard)?;
             Ok(NamedColumn { name, data_type })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -427,14 +437,12 @@ impl DataType {
         types: &[proto::Type],
         column_index: usize,
         depth: usize,
-        budget: &mut TypeTreeBudget,
+        guard: &mut TypeTreeGuard,
     ) -> Result<Self> {
         use proto::r#type::Kind;
 
-        budget.enter(depth)?;
-        let ty = types.get(column_index).context(UnexpectedSnafu {
-            msg: format!("Column index out of bounds: {column_index}"),
-        })?;
+        guard.enter(column_index, depth)?;
+        let ty = &types[column_index];
         let dt = match ty.kind() {
             Kind::Boolean => Self::Boolean { column_index },
             Kind::Byte => Self::Byte { column_index },
@@ -458,7 +466,7 @@ impl DataType {
                     }
                 );
                 let child = ty.subtypes[0] as usize;
-                let child = Box::new(Self::from_proto(types, child, depth + 1, budget)?);
+                let child = Box::new(Self::from_proto(types, child, depth + 1, guard)?);
                 Self::List {
                     column_index,
                     child,
@@ -476,9 +484,9 @@ impl DataType {
                     }
                 );
                 let key = ty.subtypes[0] as usize;
-                let key = Box::new(Self::from_proto(types, key, depth + 1, budget)?);
+                let key = Box::new(Self::from_proto(types, key, depth + 1, guard)?);
                 let value = ty.subtypes[1] as usize;
-                let value = Box::new(Self::from_proto(types, value, depth + 1, budget)?);
+                let value = Box::new(Self::from_proto(types, value, depth + 1, guard)?);
                 Self::Map {
                     column_index,
                     key,
@@ -486,8 +494,7 @@ impl DataType {
                 }
             }
             Kind::Struct => {
-                let children =
-                    parse_struct_children_from_proto(types, column_index, depth, budget)?;
+                let children = parse_struct_children_from_proto(types, column_index, depth, guard)?;
                 Self::Struct {
                     column_index,
                     children,
@@ -510,7 +517,7 @@ impl DataType {
                     .iter()
                     .map(|&index| {
                         let index = index as usize;
-                        Self::from_proto(types, index, depth + 1, budget)
+                        Self::from_proto(types, index, depth + 1, guard)
                     })
                     .collect::<Result<Vec<_>>>()?;
                 Self::Union {
@@ -711,24 +718,24 @@ mod tests {
     }
 
     #[test]
-    fn budget_accepts_the_depth_limit_and_refuses_one_past_it() {
-        let mut budget = TypeTreeBudget::new(2);
-        budget.enter(MAX_TYPE_DEPTH).unwrap();
-        let err = budget.enter(MAX_TYPE_DEPTH + 1).unwrap_err();
+    fn guard_accepts_the_depth_limit_and_refuses_one_past_it() {
+        let mut guard = TypeTreeGuard::new(2);
+        guard.enter(0, MAX_TYPE_DEPTH).unwrap();
+        let err = guard.enter(1, MAX_TYPE_DEPTH + 1).unwrap_err();
         assert!(err
             .to_string()
             .contains("type tree nests more than 100 levels"));
     }
 
     #[test]
-    fn budget_accepts_one_node_per_type_and_refuses_one_more() {
-        let mut budget = TypeTreeBudget::new(2);
-        budget.enter(0).unwrap();
-        budget.enter(1).unwrap();
-        let err = budget.enter(1).unwrap_err();
+    fn guard_accepts_each_type_once_and_refuses_a_repeat() {
+        let mut guard = TypeTreeGuard::new(2);
+        guard.enter(0, 0).unwrap();
+        guard.enter(1, 1).unwrap();
+        let err = guard.enter(1, 1).unwrap_err();
         assert!(err
             .to_string()
-            .contains("type tree references more types than the footer declares"));
+            .contains("type 1 appears more than once in the type tree"));
     }
 
     #[test]
@@ -763,13 +770,15 @@ mod tests {
 
     #[test]
     fn a_type_referenced_twice_is_refused() {
+        // The unused third type must not leave room for the repeat.
         let types = vec![
             ty(Kind::Struct, &[1, 1], &["a", "b"]),
+            ty(Kind::Int, &[], &[]),
             ty(Kind::Int, &[], &[]),
         ];
         let err = RootDataType::from_proto(&types).unwrap_err();
         assert!(err
             .to_string()
-            .contains("type tree references more types than the footer declares"));
+            .contains("type 1 appears more than once in the type tree"));
     }
 }
